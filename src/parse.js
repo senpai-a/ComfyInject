@@ -389,6 +389,75 @@ function parseMarkerContent(innerContent, messageIndex) {
 }
 
 /**
+ * Finds and parses all image markers in a message without generating images.
+ * @param {string} text
+ * @param {number} messageIndex
+ * @returns {Array<object>}
+ */
+export function parseImageMarkers(text, messageIndex) {
+    const matches = [...text.matchAll(MARKER_REGEX_GLOBAL)];
+    if (matches.length === 0) return [];
+
+    return matches.map((match) => {
+        const parsed = parseMarkerContent(match[1], messageIndex);
+
+        if (parsed.status === "parse_error") {
+            return {
+                ...parsed,
+                rawMarker: match[0],
+            };
+        }
+
+        return {
+            status: "parsed",
+            rawMarker: match[0],
+            prompt: parsed.prompt,
+            ar: parsed.ar,
+            shot: parsed.shot,
+            seed: parsed.seed,
+            repairMeta: parsed.repairMeta,
+        };
+    });
+}
+
+/**
+ * Generates an image for one successfully parsed marker.
+ * @param {object} parsed
+ * @param {number} messageIndex
+ * @returns {Promise<object>}
+ */
+export async function generateParsedMarker(parsed, messageIndex) {
+    const { prompt, ar, shot, seed, repairMeta } = parsed;
+
+    try {
+        const result = await generateImage({
+            prompt,
+            ar,
+            shot,
+            seed,
+            messageIndex,
+        });
+
+        // Save the actual used seed so LOCK can reuse it later.
+        saveLastSeed(result.seed);
+
+        return {
+            status: "ok",
+            ...result,
+            ar,
+            shot,
+            repairMeta,
+        };
+    } catch {
+        return {
+            status: "generation_error",
+            repairMeta,
+            rawMarker: parsed.rawMarker,
+        };
+    }
+}
+
+/**
  * Finds all image markers in a message, parses them one by one,
  * and returns structured results for DOM handling.
  *
@@ -456,51 +525,27 @@ function parseMarkerContent(innerContent, messageIndex) {
  *     }
  * >>}
  */
-export async function processAllImageMarkers(text, messageIndex) {
-    const matches = [...text.matchAll(MARKER_REGEX_GLOBAL)];
-    if (matches.length === 0) return [];
+export async function processAllImageMarkers(text, messageIndex, options = {}) {
+    const parsedMarkers = parseImageMarkers(text, messageIndex);
+    if (parsedMarkers.length === 0) return [];
 
     const results = [];
+    const { getStartedGeneration = null } = options;
 
-    for (const match of matches) {
-        const parsed = parseMarkerContent(match[1], messageIndex);
-
+    for (let markerIndex = 0; markerIndex < parsedMarkers.length; markerIndex++) {
+        const parsed = parsedMarkers[markerIndex];
         if (parsed.status === "parse_error") {
-            results.push({
-                ...parsed,
-                rawMarker: match[0],
-            });
+            results.push(parsed);
             continue;
         }
 
-        const { prompt, ar, shot, seed, repairMeta } = parsed;
+        const startedGeneration = typeof getStartedGeneration === "function"
+            ? getStartedGeneration(parsed, markerIndex)
+            : null;
 
-        try {
-            const result = await generateImage({
-                prompt,
-                ar,
-                shot,
-                seed,
-                messageIndex,
-            });
-
-            // Save the actual used seed so LOCK can reuse it later.
-            saveLastSeed(result.seed);
-
-            results.push({
-                status: "ok",
-                ...result,
-                ar,
-                shot,
-                repairMeta,
-            });
-        } catch {
-            results.push({
-                status: "generation_error",
-                repairMeta,
-                rawMarker: match[0],
-            });
-        }
+        results.push(startedGeneration
+            ? await startedGeneration
+            : await generateParsedMarker(parsed, messageIndex));
     }
 
     return results;
