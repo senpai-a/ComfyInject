@@ -1,4 +1,4 @@
-import { MARKER_REGEX, processAllImageMarkers, hasImageMarker } from "./parse.js";
+import { MARKER_REGEX, processAllImageMarkers, hasImageMarker, parseImageMarkers, generateParsedMarker } from "./parse.js";
 import { generateImage } from "./comfy.js";
 import { saveLastSeed, getImageData } from "./state.js";
 import { MODULE_NAME } from "../settings.js";
@@ -149,6 +149,132 @@ function formatMarkerPosition(markerNumber, totalMarkers) {
     return totalMarkers > 1 ? ` ${markerNumber}/${totalMarkers}` : "";
 }
 
+let activeStream = null;
+const LIVE_STREAM_SCAN_INTERVAL_MS = 500;
+
+/**
+ * Resets live stream marker tracking for a new generation.
+ */
+function resetLiveStream() {
+    stopLiveStreamScanner();
+
+    activeStream = {
+        text: "",
+        jobs: new Map(),
+        scanner: setInterval(startLiveMarkerGenerations, LIVE_STREAM_SCAN_INTERVAL_MS),
+    };
+}
+
+/**
+ * Stops the live stream scanner without discarding already-started jobs.
+ */
+function stopLiveStreamScanner() {
+    if (!activeStream?.scanner) return;
+
+    clearInterval(activeStream.scanner);
+    activeStream.scanner = null;
+}
+
+/**
+ * Clears all live stream state for the current generation.
+ */
+function clearLiveStream() {
+    stopLiveStreamScanner();
+    activeStream = null;
+}
+
+/**
+ * Returns the best current message index to use while streaming.
+ * During normal streaming ST has already created the live bot message.
+ * @returns {number}
+ */
+function getLiveMessageIndex() {
+    const context = SillyTavern.getContext();
+    if (!Array.isArray(context.chat) || context.chat.length === 0) return 0;
+
+    for (let i = context.chat.length - 1; i >= 0; i--) {
+        if (!context.chat[i]?.is_user) return i;
+    }
+
+    return context.chat.length - 1;
+}
+
+/**
+ * Builds a stable key for one marker occurrence within the streamed reply.
+ * Marker order is more reliable than raw marker text because final message
+ * formatting can differ slightly from the stream buffer.
+ * @param {number} markerIndex
+ * @returns {string}
+ */
+function getMarkerJobKey(markerIndex) {
+    return String(markerIndex);
+}
+
+/**
+ * Updates the stream buffer from ST's stream event payload.
+ * Current ST sends the full generated text so far; this also tolerates
+ * providers/extensions that emit incremental chunks.
+ * @param {string} text
+ */
+function updateStreamText(text) {
+    if (!activeStream) resetLiveStream();
+
+    const incoming = String(text ?? "");
+    if (!incoming) return;
+
+    if (!activeStream.text || incoming.startsWith(activeStream.text)) {
+        activeStream.text = incoming;
+    } else {
+        activeStream.text += incoming;
+    }
+}
+
+/**
+ * Starts ComfyUI jobs as soon as complete markers appear in streamed output.
+ * Jobs are cached and consumed later by processMessage().
+ */
+function startLiveMarkerGenerations() {
+    if (!activeStream?.text) return;
+
+    const messageIndex = getLiveMessageIndex();
+    const parsedMarkers = parseImageMarkers(activeStream.text, messageIndex);
+
+    parsedMarkers.forEach((parsed, markerIndex) => {
+        if (parsed.status !== "parsed") return;
+
+        const key = getMarkerJobKey(markerIndex);
+        if (activeStream.jobs.has(key)) return;
+
+        const promise = generateParsedMarker(parsed, messageIndex);
+        activeStream.jobs.set(key, { promise, used: false });
+
+        console.log("[ComfyInject] Live marker detected, ComfyUI job started:", {
+            messageIndex,
+            markerNumber: markerIndex + 1,
+        });
+    });
+}
+
+/**
+ * Returns a pre-started generation promise for a final rendered marker.
+ * @param {object} parsed
+ * @param {number} markerIndex
+ * @returns {Promise<object>|null}
+ */
+function getLiveGeneration(parsed, markerIndex) {
+    if (!activeStream?.jobs) return null;
+
+    const key = getMarkerJobKey(markerIndex);
+    const job = activeStream.jobs.get(key);
+    if (!job || job.used) return null;
+
+    job.used = true;
+    console.log("[ComfyInject] Reusing live ComfyUI job:", {
+        markerNumber: markerIndex + 1,
+    });
+    return job.promise;
+}
+
 /**
  * Adds retry buttons to all rendered comfyinject images in a message.
  * This is done via DOM manipulation (not in message.mes) because
@@ -251,8 +377,16 @@ async function processMessage(index, options = {}) {
     }
     message.mes = originalMes;
 
-    // Process all markers sequentially
-    const results = await processAllImageMarkers(message.mes, index);
+    // Process all markers sequentially, reusing any jobs that were started
+    // while this message was still streaming.
+    const useLiveGenerations = activeStream && index === getLiveMessageIndex();
+    const results = await processAllImageMarkers(message.mes, index, {
+        getStartedGeneration: useLiveGenerations ? getLiveGeneration : null,
+    });
+
+    if (useLiveGenerations) {
+        clearLiveStream();
+    }
 
     if (results.length === 0) return { repairedCount: 0, totalCount: 0 };
 
@@ -579,6 +713,25 @@ async function retryImage(sendDate, imgIndex) {
 export function initDom() {
     const { eventSource, event_types } = SillyTavern.getContext();
 
+    // Start watching streamed text as soon as a visible generation begins.
+    eventSource.on(event_types.GENERATION_STARTED, (type, _params, isDryRun) => {
+        if (type === "quiet" || isDryRun) {
+            clearLiveStream();
+            return;
+        }
+
+        resetLiveStream();
+    });
+
+    // ST emits the current streamed text frequently. Keep this handler cheap;
+    // the timer started in resetLiveStream() does marker scanning.
+    eventSource.on(event_types.STREAM_TOKEN_RECEIVED, (text) => {
+        updateStreamText(text);
+    });
+
+    eventSource.on(event_types.GENERATION_ENDED, stopLiveStreamScanner);
+    eventSource.on(event_types.GENERATION_STOPPED, stopLiveStreamScanner);
+
     // Process new bot messages as they are rendered
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, async (index) => {
         await processMessage(index);
@@ -586,6 +739,7 @@ export function initDom() {
 
     // Re-scan when chat changes
     eventSource.on(event_types.CHAT_CHANGED, async () => {
+        clearLiveStream();
         await scanExistingMessages();
     });
 
