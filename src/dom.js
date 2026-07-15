@@ -319,7 +319,7 @@ function addRetryButtons(index) {
         btn.addEventListener("click", async (e) => {
             e.stopPropagation();
             e.preventDefault();
-            await retryImage(sendDate, imgIndex);
+            await retryImage(sendDate, imgIndex, btn);
         });
 
         wrapper.appendChild(btn);
@@ -365,6 +365,7 @@ async function processMessage(index, options = {}) {
 
     // Show placeholders by patching mes temporarily
     const originalMes = message.mes;
+    const originalSendDate = message.send_date;
     let placeholderIndex = 0;
     message.mes = message.mes.replace(/\[\[IMG:\s*.+?\s*\]\]/gs, () => {
         placeholderIndex++;
@@ -386,6 +387,19 @@ async function processMessage(index, options = {}) {
 
     if (useLiveGenerations) {
         clearLiveStream();
+    }
+
+    const currentMessage = context.chat[index];
+    if (
+        currentMessage?.send_date !== originalSendDate ||
+        currentMessage?.mes !== originalMes
+    ) {
+        console.warn("[ComfyInject] Discarding stale image results because the source message changed:", {
+            messageIndex: index,
+            originalSendDate,
+            currentSendDate: currentMessage?.send_date || null,
+        });
+        return { repairedCount: 0, totalCount: 0 };
     }
 
     if (results.length === 0) return { repairedCount: 0, totalCount: 0 };
@@ -423,6 +437,7 @@ async function processMessage(index, options = {}) {
             const imgTag = buildImgTag(imageUrl, prompt, seed);
             message.mes = message.mes.replace(MARKER_REGEX, imgTag);
             metadataArray.push({
+                seed,
                 ar,
                 shot,
                 promptId,
@@ -570,26 +585,47 @@ async function scanExistingMessages() {
  * Uses send_date to look up metadata (stable across deletions).
  * @param {string} sendDate - The send_date of the message to retry
  * @param {number} imgIndex - Which image within the message to retry (0-based)
+ * @param {HTMLElement|null} retryBtn - The clicked retry button, if available
  */
-async function retryImage(sendDate, imgIndex) {
+async function retryImage(sendDate, imgIndex, retryBtn = null) {
     const context = SillyTavern.getContext();
     const { updateMessageBlock } = SillyTavern.getContext();
+
+    if (!context.chatMetadata[MODULE_NAME]) {
+        context.chatMetadata[MODULE_NAME] = {};
+    }
     const metadata = context.chatMetadata[MODULE_NAME];
 
     // Find the current array index for this message
     const messageIndex = findIndexBySendDate(sendDate);
-    if (messageIndex === -1) return;
+    if (messageIndex === -1) {
+        console.warn("[ComfyInject] Retry skipped: message not found", { sendDate, imgIndex });
+        return;
+    }
 
     const message = context.chat[messageIndex];
-    if (!message || !metadata) return;
+    if (!message) {
+        console.warn("[ComfyInject] Retry skipped: message missing", { messageIndex, imgIndex });
+        return;
+    }
 
     // Parse prompt from the img tag in mes (source of truth, not stored in metadata)
     const imgTags = [...message.mes.matchAll(/<img class="comfyinject-image"[^>]*>/g)];
     const targetTag = imgTags[imgIndex];
-    if (!targetTag) return;
+    if (!targetTag) {
+        console.warn("[ComfyInject] Retry skipped: image tag not found", {
+            messageIndex,
+            imgIndex,
+            imageCount: imgTags.length,
+        });
+        return;
+    }
 
     const prompt = targetTag[0].match(/data-prompt="([^"]*)"/)?.[1]?.replace(/&quot;/g, '"') || "";
-    if (!prompt) return;
+    if (!prompt) {
+        console.warn("[ComfyInject] Retry skipped: image prompt missing", { messageIndex, imgIndex });
+        return;
+    }
 
     // Look up metadata for supplementary fields (ar, shot)
     const images = getImageData(metadata, sendDate).length > 0
@@ -608,7 +644,6 @@ async function retryImage(sendDate, imgIndex) {
     const newSeed = Math.floor(Math.random() * 9007199254740991);
 
     // Show generating state on the retry button
-    const retryBtn = document.querySelector(`.comfyinject-retry[data-senddate="${sendDate}"][data-imgindex="${imgIndex}"]`);
     if (retryBtn) {
         retryBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
         retryBtn.style.pointerEvents = "none";
@@ -642,8 +677,13 @@ async function retryImage(sendDate, imgIndex) {
 
     // Update metadata — try send_date key first, fall back to index for legacy.
     // Guard against missing or malformed entries so retry does not recreate bad metadata.
-    const metaKey = metadata[sendDate] ? sendDate : messageIndex;
-    const metaEntry = metadata[metaKey];
+    const metaKey = metadata[sendDate] ? sendDate : (metadata[messageIndex] ? messageIndex : sendDate);
+    let metaEntry = metadata[metaKey];
+
+    if (!metaEntry) {
+        metaEntry = [];
+        metadata[metaKey] = metaEntry;
+    }
 
     if (Array.isArray(metaEntry)) {
         const existingEntry = metaEntry[imgIndex] && typeof metaEntry[imgIndex] === "object"
