@@ -244,6 +244,10 @@ function updateStreamText(text) {
     } else {
         activeStream.text += incoming;
     }
+
+    // Refresh the live display on every token when jobs are active so that
+    // pending placeholders stay in sync with the streamed text as it grows.
+    if (activeStream.jobs.size > 0) renderLiveStream();
 }
 
 /**
@@ -263,7 +267,15 @@ function startLiveMarkerGenerations() {
         if (activeStream.jobs.has(key)) return;
 
         const promise = generateParsedMarker(parsed, messageIndex);
-        activeStream.jobs.set(key, { promise, used: false });
+        activeStream.jobs.set(key, { promise, result: null, used: false });
+
+        promise.then(result => {
+            const job = activeStream?.jobs.get(key);
+            if (job) {
+                job.result = result;
+                renderLiveStream();
+            }
+        });
 
         console.log("[ComfyInject] Live marker detected, ComfyUI job started:", {
             messageIndex,
@@ -290,6 +302,55 @@ function getLiveGeneration(parsed, markerIndex) {
         markerNumber: markerIndex + 1,
     });
     return job.promise;
+}
+
+/**
+ * Re-renders the live streaming message with current job states.
+ * Markers with completed jobs are replaced with images or error spans.
+ * Markers with in-flight jobs are replaced with pending placeholder spans.
+ *
+ * Uses the borrow pattern: temporarily sets message.mes to the display text,
+ * calls updateMessageBlock, then restores the original mes so ST can keep
+ * appending tokens and processMessage sees the raw markers when the stream ends.
+ */
+function renderLiveStream() {
+    if (!activeStream) return;
+
+    const messageIndex = getLiveMessageIndex();
+    const context = SillyTavern.getContext();
+    const message = context.chat[messageIndex];
+    if (!message || message.is_user) return;
+
+    const { updateMessageBlock } = SillyTavern.getContext();
+
+    // Count total markers in the current stream buffer for position labels.
+    const totalMarkers = (activeStream.text.match(/\[\[IMG:\s*.+?\s*\]\]/gs) || []).length;
+    if (totalMarkers === 0) return;
+
+    // Replace each [[IMG:...]] with its current job state.
+    let markerIdx = 0;
+    const displayText = activeStream.text.replace(/\[\[IMG:\s*.+?\s*\]\]/gs, () => {
+        const i = markerIdx++;
+        const key = getMarkerJobKey(i);
+        const job = activeStream?.jobs.get(key);
+        const markerPosition = formatMarkerPosition(i + 1, totalMarkers);
+
+        if (!job || job.result === null) {
+            return `<span class="comfyinject-pending">[Generating image${markerPosition}...]</span>`;
+        }
+
+        const result = job.result;
+        if (result?.status === "ok") {
+            return buildImgTag(result.imageUrl, result.prompt, result.seed);
+        }
+        return `<span class="comfyinject-error">[Image generation failed${markerPosition ? `: marker${markerPosition}` : ""}]</span>`;
+    });
+
+    // Borrow: temporarily replace mes with the display text, render, restore.
+    const savedMes = message.mes;
+    message.mes = displayText;
+    try { updateMessageBlock(messageIndex, message); } catch (_e) {}
+    message.mes = savedMes;
 }
 
 /**
