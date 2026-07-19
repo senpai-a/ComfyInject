@@ -245,8 +245,8 @@ function updateStreamText(text) {
         activeStream.text += incoming;
     }
 
-    // Refresh the live display on every token when jobs are active so that
-    // pending placeholders stay in sync with the streamed text as it grows.
+    // Override ST's streaming DOM update with our processed version.
+    // Direct innerHTML is cheap enough to run on every token.
     if (activeStream.jobs.size > 0) renderLiveStream();
 }
 
@@ -282,6 +282,10 @@ function startLiveMarkerGenerations() {
             markerNumber: markerIndex + 1,
         });
     });
+
+    // Re-render the live message on every scan tick so placeholders and
+    // completed images stay in sync with the streamed text.
+    if (activeStream.jobs.size > 0) renderLiveStream();
 }
 
 /**
@@ -309,19 +313,14 @@ function getLiveGeneration(parsed, markerIndex) {
  * Markers with completed jobs are replaced with images or error spans.
  * Markers with in-flight jobs are replaced with pending placeholder spans.
  *
- * Uses the borrow pattern: temporarily sets message.mes to the display text,
- * calls updateMessageBlock, then restores the original mes so ST can keep
- * appending tokens and processMessage sees the raw markers when the stream ends.
+ * Directly writes to the .mes_text DOM node so ST's per-token streaming
+ * renders cannot overwrite our output. Does not touch message.mes so
+ * processMessage still sees the raw markers when the stream ends.
  */
 function renderLiveStream() {
     if (!activeStream) return;
 
     const messageIndex = getLiveMessageIndex();
-    const context = SillyTavern.getContext();
-    const message = context.chat[messageIndex];
-    if (!message || message.is_user) return;
-
-    const { updateMessageBlock } = SillyTavern.getContext();
 
     // Count total markers in the current stream buffer for position labels.
     const totalMarkers = (activeStream.text.match(/\[\[IMG:\s*.+?\s*\]\]/gs) || []).length;
@@ -346,11 +345,12 @@ function renderLiveStream() {
         return `<span class="comfyinject-error">[Image generation failed${markerPosition ? `: marker${markerPosition}` : ""}]</span>`;
     });
 
-    // Borrow: temporarily replace mes with the display text, render, restore.
-    const savedMes = message.mes;
-    message.mes = displayText;
-    try { updateMessageBlock(messageIndex, message); } catch (_e) {}
-    message.mes = savedMes;
+    // Direct DOM update — fast enough to call on every token.
+    // ST's streaming renderer overwrites .mes_text on each token; by updating
+    // the same node directly we always have the last word without a full
+    // message re-render.
+    const msgNode = document.querySelector(`[mesid="${messageIndex}"] .mes_text`);
+    if (msgNode) msgNode.innerHTML = displayText;
 }
 
 /**
