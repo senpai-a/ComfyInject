@@ -1,4 +1,4 @@
-import { MARKER_REGEX, processAllImageMarkers, hasImageMarker, parseImageMarkers, generateParsedMarker } from "./parse.js";
+import { hasImageMarker, parseImageMarkers, generateParsedMarker } from "./parse.js";
 import { generateImage } from "./comfy.js";
 import { saveLastSeed, getImageData } from "./state.js";
 import { MODULE_NAME } from "../settings.js";
@@ -152,6 +152,27 @@ function formatMarkerPosition(markerNumber, totalMarkers) {
 let activeStream = null;
 const LIVE_STREAM_SCAN_INTERVAL_MS = 500;
 
+// True while a renderLiveStream() call is already queued for the next animation frame.
+// Prevents queuing more than one rAF per frame.
+let liveRenderScheduled = false;
+
+// Tracks which message indices are currently being processed to prevent duplicate jobs.
+const processingMessages = new Set();
+
+// Incremented whenever the generation context is invalidated:
+// new generation started, generation stopped/cancelled, or chat changed.
+// processMessage() captures this at call time and discards results if it changed.
+let activeGenerationId = 0;
+
+/**
+ * Bumps the generation ID, invalidating any in-progress processMessage results,
+ * and clears the per-message processing guard so new calls are not blocked.
+ */
+function bumpGenerationId() {
+    activeGenerationId++;
+    processingMessages.clear();
+}
+
 /**
  * Resets live stream marker tracking for a new generation.
  */
@@ -181,6 +202,24 @@ function stopLiveStreamScanner() {
 function clearLiveStream() {
     stopLiveStreamScanner();
     activeStream = null;
+}
+
+/**
+ * Schedules renderLiveStream() for the next animation frame.
+ * Multiple calls within the same frame are coalesced into one render.
+ *
+ * ST fires STREAM_TOKEN_RECEIVED before it calls onProgressStreaming() to
+ * update the DOM (they are consecutive awaits in the streaming loop).
+ * Deferring to rAF guarantees we run after ST has written the formatted HTML
+ * but before the browser paints, so the user only ever sees our version.
+ */
+function scheduleRenderLiveStream() {
+    if (liveRenderScheduled) return;
+    liveRenderScheduled = true;
+    requestAnimationFrame(() => {
+        liveRenderScheduled = false;
+        if (activeStream?.jobs.size > 0) renderLiveStream();
+    });
 }
 
 /**
@@ -227,6 +266,11 @@ function updateStreamText(text) {
     } else {
         activeStream.text += incoming;
     }
+
+    // Schedule a render for the next animation frame.
+    // ST updates the DOM *after* firing this event, so a direct call here
+    // would read stale HTML.  rAF fires after ST's DOM write but before paint.
+    if (activeStream.jobs.size > 0) scheduleRenderLiveStream();
 }
 
 /**
@@ -246,13 +290,25 @@ function startLiveMarkerGenerations() {
         if (activeStream.jobs.has(key)) return;
 
         const promise = generateParsedMarker(parsed, messageIndex);
-        activeStream.jobs.set(key, { promise, used: false });
+        activeStream.jobs.set(key, { promise, result: null, used: false });
+
+        promise.then(result => {
+            const job = activeStream?.jobs.get(key);
+            if (job) {
+                job.result = result;
+                renderLiveStream();
+            }
+        });
 
         console.log("[ComfyInject] Live marker detected, ComfyUI job started:", {
             messageIndex,
             markerNumber: markerIndex + 1,
         });
     });
+
+    // Re-render the live message on every scan tick so placeholders and
+    // completed images stay in sync with the streamed text.
+    if (activeStream.jobs.size > 0) renderLiveStream();
 }
 
 /**
@@ -273,6 +329,55 @@ function getLiveGeneration(parsed, markerIndex) {
         markerNumber: markerIndex + 1,
     });
     return job.promise;
+}
+
+/**
+ * Re-renders the live streaming message with current job states.
+ * Markers with completed jobs are replaced with images or error spans.
+ * Markers with in-flight jobs are replaced with pending placeholder spans.
+ *
+ * Reads ST's already-formatted .mes_text innerHTML, replaces [[IMG:...]]
+ * fragments with placeholders or images, and writes the result back.
+ * Operating on the formatted HTML preserves ST's markdown styling
+ * (coloured quotes, bold, etc.) and avoids overwriting message.mes so
+ * processMessage still sees the raw markers when the stream ends.
+ */
+function renderLiveStream() {
+    if (!activeStream) return;
+
+    const messageIndex = getLiveMessageIndex();
+
+    // Read ST's already-formatted HTML rather than the raw stream buffer.
+    // [[IMG:...]] is not a markdown construct so it appears literally in the
+    // rendered output.  Replacing only those fragments lets us keep ST's
+    // surrounding formatting (coloured quotes, bold, etc.) intact.
+    const msgNode = document.querySelector(`[mesid="${messageIndex}"] .mes_text`);
+    if (!msgNode) return;
+
+    const currentHtml = msgNode.innerHTML;
+
+    const totalMarkers = (currentHtml.match(/\[\[IMG:\s*.+?\s*\]\]/gs) || []).length;
+    if (totalMarkers === 0) return;
+
+    let markerIdx = 0;
+    const displayHtml = currentHtml.replace(/\[\[IMG:\s*.+?\s*\]\]/gs, () => {
+        const i = markerIdx++;
+        const key = getMarkerJobKey(i);
+        const job = activeStream?.jobs.get(key);
+        const markerPosition = formatMarkerPosition(i + 1, totalMarkers);
+
+        if (!job || job.result === null) {
+            return `<span class="comfyinject-pending">[Generating image${markerPosition}...]</span>`;
+        }
+
+        const result = job.result;
+        if (result?.status === "ok") {
+            return buildImgTag(result.imageUrl, result.prompt, result.seed);
+        }
+        return `<span class="comfyinject-error">[Image generation failed${markerPosition ? `: marker${markerPosition}` : ""}]</span>`;
+    });
+
+    if (displayHtml !== currentHtml) msgNode.innerHTML = displayHtml;
 }
 
 /**
@@ -348,7 +453,7 @@ async function processMessage(index, options = {}) {
     const context = SillyTavern.getContext();
     const message = context.chat[index];
     const { updateMessageBlock } = SillyTavern.getContext();
-    const { suppressRepairNotifications = false } = options;
+    const { suppressRepairNotifications = false, checkGenerationId = false } = options;
 
     if (!message) return { repairedCount: 0, totalCount: 0 };
 
@@ -358,193 +463,191 @@ async function processMessage(index, options = {}) {
     // Skip if no marker present
     if (!hasImageMarker(message.mes)) return { repairedCount: 0, totalCount: 0 };
 
-    console.log(`[ComfyInject] Processing message ${index}`);
-
-    // Count markers for the placeholder
-    const markerCount = (message.mes.match(/\[\[IMG:\s*.+?\s*\]\]/gs) || []).length;
-
-    // Show placeholders by patching mes temporarily
-    const originalMes = message.mes;
-    const originalSendDate = message.send_date;
-    let placeholderIndex = 0;
-    message.mes = message.mes.replace(/\[\[IMG:\s*.+?\s*\]\]/gs, () => {
-        placeholderIndex++;
-        return `<span class="comfyinject-pending">[Generating image ${placeholderIndex}/${markerCount}...]</span>`;
-    });
-    try {
-        updateMessageBlock(index, message);
-    } catch (e) {
-        // ST's reasoning handler may crash on some messages, that's okay
-    }
-    message.mes = originalMes;
-
-    // Process all markers sequentially, reusing any jobs that were started
-    // while this message was still streaming.
-    const useLiveGenerations = activeStream && index === getLiveMessageIndex();
-    const results = await processAllImageMarkers(message.mes, index, {
-        getStartedGeneration: useLiveGenerations ? getLiveGeneration : null,
-    });
-
-    if (useLiveGenerations) {
-        clearLiveStream();
-    }
-
-    const currentMessage = context.chat[index];
-    if (
-        currentMessage?.send_date !== originalSendDate ||
-        currentMessage?.mes !== originalMes
-    ) {
-        console.warn("[ComfyInject] Discarding stale image results because the source message changed:", {
-            messageIndex: index,
-            originalSendDate,
-            currentSendDate: currentMessage?.send_date || null,
-        });
+    // Prevent concurrent processing of the same message index.
+    // A second call for the same index (e.g. duplicate CHARACTER_MESSAGE_RENDERED)
+    // would start redundant ComfyUI jobs for markers that are already in flight.
+    if (processingMessages.has(index)) {
+        console.log(`[ComfyInject] Skipping duplicate processMessage for index ${index}`);
         return { repairedCount: 0, totalCount: 0 };
     }
 
-    if (results.length === 0) return { repairedCount: 0, totalCount: 0 };
+    // Snapshot the current generation ID so we can detect cancellation or a new
+    // generation starting while we are awaiting ComfyUI results.
+    const capturedGenId = activeGenerationId;
+    processingMessages.add(index);
 
-    // Replace each marker with either a generated image or a structured error state.
-    // Only successful generations should be saved into metadata.
-    const metadataArray = [];
-    let repairedCount = 0;
-
-    for (let markerIndex = 0; markerIndex < results.length; markerIndex++) {
-        const result = results[markerIndex];
-        const markerNumber = markerIndex + 1;
-        const markerPosition = formatMarkerPosition(markerNumber, results.length);
-
-        if (result?.status === "ok") {
-            const {
-                imageUrl,
-                seed,
-                prompt,
-                ar,
-                shot,
-                promptId,
-                filename,
-                effectiveAr,
-                effectiveShot,
-                resolution,
-                shotTags,
-                repairMeta,
-            } = result;
-
-            if (hasMeaningfulRepair(repairMeta)) {
-                repairedCount++;
-            }
-
-            const imgTag = buildImgTag(imageUrl, prompt, seed);
-            message.mes = message.mes.replace(MARKER_REGEX, imgTag);
-            metadataArray.push({
-                seed,
-                ar,
-                shot,
-                promptId,
-                filename,
-                effectiveAr,
-                effectiveShot,
-                resolution,
-                shotTags,
-                repairMeta,
-            });
-        } else if (result?.status === "parse_error") {
-            // The marker was found, but parsing could not recover a usable prompt.
-            const reason = result?.reason;
-            let errorText;
-            switch (reason) {
-                case "empty_prompt":
-                    errorText = `[Image marker${markerPosition} invalid: empty prompt]`;
-                    break;
-                case "empty_marker":
-                    errorText = `[Image marker${markerPosition} invalid: empty marker]`;
-                    break;
-                default:
-                    errorText = `[Image marker${markerPosition} invalid]`;
-                    break;
-            }
-
-            console.warn("[ComfyInject] Image marker parse failed:", {
-                reason,
-                rawMarker: result?.rawMarker || null,
-                messageIndex: index,
-                markerNumber,
-                totalMarkers: results.length,
-            });
-
-            if (!suppressRepairNotifications) {
-                maybeShowParseFailureToast(errorText);
-            }
-
-            message.mes = message.mes.replace(
-                MARKER_REGEX,
-                `<span class="comfyinject-error">${errorText}</span>`
-            );
-        } else if (result?.status === "generation_error") {
-            // Marker parsed successfully, but image generation failed.
-            const errorText = `[Image generation failed${markerPosition ? `: marker${markerPosition}` : ""}]`;
-
-            console.error("[ComfyInject] Image generation failed:", {
-                messageIndex: index,
-                markerNumber,
-                totalMarkers: results.length,
-            });
-
-            message.mes = message.mes.replace(
-                MARKER_REGEX,
-                `<span class="comfyinject-error">${errorText}</span>`
-            );
-        } else {
-            // Fallback guard for any unexpected result shape.
-            const errorText = `[Image generation failed${markerPosition ?`: marker${markerPosition}` : ""}]`;
-
-            console.error("[ComfyInject] Unexpected marker result shape:", {
-                result,
-                messageIndex: index,
-                markerNumber,
-                totalMarkers: results.length,
-            });
-
-            message.mes = message.mes.replace(
-                MARKER_REGEX,
-                `<span class="comfyinject-error">${errorText}</span>`
-            );
-        }
-    }
-
-    // Re-render the message using ST's own update function
     try {
-        updateMessageBlock(index, message);
-    } catch (e) {
-        // ST's reasoning handler may crash on some messages, that's okay
-        // metadata and saveChat still run below
+        console.log(`[ComfyInject] Processing message ${index}`);
+
+        const originalSendDate = message.send_date;
+        const parsedMarkers = parseImageMarkers(message.mes, index);
+        const markerCount = parsedMarkers.length;
+
+        if (markerCount === 0) return { repairedCount: 0, totalCount: 0 };
+
+        // Replace each [[IMG:...]] marker with an indexed placeholder.
+        // Jobs can complete out of order, so each needs a unique handle to target.
+        // The closing `"` in the class name bounds the index so idx-1 won't match idx-10.
+        let pidx = 0;
+        message.mes = message.mes.replace(/\[\[IMG:\s*.+?\s*\]\]/gs, () => {
+            const i = pidx++;
+            return `<span class="comfyinject-pending comfyinject-idx-${i}">[Generating image ${i + 1}/${markerCount}...]</span>`;
+        });
+        try { updateMessageBlock(index, message); } catch (_e) {}
+
+        const useLiveGenerations = activeStream && index === getLiveMessageIndex();
+
+        // Sparse results array — filled by handleJobResult as each job settles.
+        const results = new Array(markerCount).fill(null);
+        let repairedCount = 0;
+
+        /**
+         * Called synchronously when each job settles.
+         * Replaces the matching indexed placeholder and immediately re-renders
+         * so the user sees each image as soon as it is ready.
+         * @param {object} result
+         * @param {number} markerIndex
+         */
+        const handleJobResult = (result, markerIndex) => {
+            // Drop the result if the generation was cancelled or superseded.
+            if (checkGenerationId && capturedGenId !== activeGenerationId) return;
+
+            const currentMessage = context.chat[index];
+            if (!currentMessage || currentMessage.send_date !== originalSendDate) return;
+
+            const markerNumber = markerIndex + 1;
+            const markerPosition = formatMarkerPosition(markerNumber, markerCount);
+            let replacement;
+
+            if (result?.status === "ok") {
+                if (hasMeaningfulRepair(result.repairMeta)) repairedCount++;
+                results[markerIndex] = result;
+                replacement = buildImgTag(result.imageUrl, result.prompt, result.seed);
+
+            } else if (result?.status === "parse_error") {
+                const reason = result?.reason;
+                let errorText;
+                switch (reason) {
+                    case "empty_prompt": errorText = `[Image marker${markerPosition} invalid: empty prompt]`; break;
+                    case "empty_marker": errorText = `[Image marker${markerPosition} invalid: empty marker]`; break;
+                    default:             errorText = `[Image marker${markerPosition} invalid]`; break;
+                }
+                console.warn("[ComfyInject] Image marker parse failed:", {
+                    reason, rawMarker: result?.rawMarker || null,
+                    messageIndex: index, markerNumber, totalMarkers: markerCount,
+                });
+                if (!suppressRepairNotifications) maybeShowParseFailureToast(errorText);
+                replacement = `<span class="comfyinject-error">${errorText}</span>`;
+
+            } else if (result?.status === "generation_error") {
+                const errorText = `[Image generation failed${markerPosition ? `: marker${markerPosition}` : ""}]`;
+                console.error("[ComfyInject] Image generation failed:", {
+                    messageIndex: index, markerNumber, totalMarkers: markerCount,
+                });
+                replacement = `<span class="comfyinject-error">${errorText}</span>`;
+
+            } else {
+                const errorText = `[Image generation failed${markerPosition ? `: marker${markerPosition}` : ""}]`;
+                console.error("[ComfyInject] Unexpected marker result shape:", {
+                    result, messageIndex: index, markerNumber, totalMarkers: markerCount,
+                });
+                replacement = `<span class="comfyinject-error">${errorText}</span>`;
+            }
+
+            // Target exactly the indexed placeholder — safe for out-of-order completion.
+            currentMessage.mes = currentMessage.mes.replace(
+                new RegExp(`<span[^>]*comfyinject-idx-${markerIndex}"[^>]*>[^<]*</span>`),
+                replacement
+            );
+            try { updateMessageBlock(index, currentMessage); } catch (_e) {}
+        };
+
+        // Build one promise per marker.
+        // Parse errors are handled synchronously; generation jobs call handleJobResult
+        // as soon as ComfyUI responds, inserting the image without waiting for others.
+        const jobPromises = parsedMarkers.map((parsed, markerIndex) => {
+            if (parsed.status === "parse_error") {
+                handleJobResult(parsed, markerIndex);
+                return Promise.resolve();
+            }
+
+            const liveJob = useLiveGenerations ? getLiveGeneration(parsed, markerIndex) : null;
+            const jobPromise = liveJob ?? generateParsedMarker(parsed, index);
+            return jobPromise.then(result => handleJobResult(result, markerIndex));
+        });
+
+        if (useLiveGenerations) {
+            clearLiveStream();
+        }
+
+        // Wait for all jobs to settle.  Each image was already inserted by handleJobResult.
+        await Promise.all(jobPromises);
+
+        // Post-await generation check — covers cancel / chat-change during the wait.
+        if (checkGenerationId && capturedGenId !== activeGenerationId) {
+            console.log(`[ComfyInject] Generation changed (${capturedGenId} → ${activeGenerationId}), cleaning up placeholders for message ${index}`);
+
+            // Replace any placeholder spans that were never resolved (their jobs were
+            // dropped by the cancellation check in handleJobResult).
+            // We update in-memory only — no saveChat — so the original [[IMG:...]] markers
+            // remain on disk and the user can retry by reloading or regenerating.
+            const cancelledMessage = context.chat[index];
+            if (cancelledMessage && cancelledMessage.send_date === originalSendDate) {
+                const cleaned = cancelledMessage.mes.replace(
+                    /<span[^>]*comfyinject-pending[^>]*>[^<]*<\/span>/g,
+                    `<span class="comfyinject-error">[Image generation cancelled]</span>`
+                );
+                if (cleaned !== cancelledMessage.mes) {
+                    cancelledMessage.mes = cleaned;
+                    try { updateMessageBlock(index, cancelledMessage); } catch (_e) {}
+                }
+            }
+
+            return { repairedCount: 0, totalCount: markerCount };
+        }
+
+        // Message integrity check — covers deletion or swipe during the wait.
+        const currentMessage = context.chat[index];
+        if (!currentMessage || currentMessage.send_date !== originalSendDate) {
+            console.warn("[ComfyInject] Message removed or replaced during generation, discarding save:", {
+                messageIndex: index, originalSendDate,
+            });
+            return { repairedCount: 0, totalCount: markerCount };
+        }
+
+        // Add retry buttons now that all images are in the DOM.
+        addRetryButtons(index);
+
+        // Persist metadata keyed by send_date (only successful results).
+        if (!context.chatMetadata[MODULE_NAME]) {
+            context.chatMetadata[MODULE_NAME] = {};
+        }
+        const metadataArray = results
+            .filter(r => r?.status === "ok")
+            .map(r => ({
+                seed: r.seed, ar: r.ar, shot: r.shot,
+                promptId: r.promptId, filename: r.filename,
+                effectiveAr: r.effectiveAr, effectiveShot: r.effectiveShot,
+                resolution: r.resolution, shotTags: r.shotTags,
+                repairMeta: r.repairMeta,
+            }));
+
+        context.chatMetadata[MODULE_NAME][currentMessage.send_date] = metadataArray;
+        await context.saveMetadata();
+        await context.saveChat();
+
+        if (!suppressRepairNotifications) {
+            maybeShowGroupedRepairToast(repairedCount, markerCount);
+            maybeLogGroupedRepairWarning(index, repairedCount, markerCount);
+        }
+
+        const successCount = results.filter(r => r?.status === "ok").length;
+        console.log(`[ComfyInject] Message ${index} saved with ${successCount} injected image(s)`);
+
+        return { repairedCount, totalCount: markerCount };
+    } finally {
+        processingMessages.delete(index);
     }
-
-    // Add retry buttons via DOM manipulation (after ST renders the message)
-    addRetryButtons(index);
-
-    // Save metadata keyed by send_date
-    if (!context.chatMetadata[MODULE_NAME]) {
-        context.chatMetadata[MODULE_NAME] = {};
-    }
-    context.chatMetadata[MODULE_NAME][message.send_date] = metadataArray;
-
-    // Persist everything to disk
-    await context.saveMetadata();
-    await context.saveChat();
-
-    if (!suppressRepairNotifications) {
-        maybeShowGroupedRepairToast(repairedCount, results.length);
-        maybeLogGroupedRepairWarning(index, repairedCount, results.length);
-    }
-
-    const successCount = results.filter((result) => result?.status === "ok").length;
-    console.log(`[ComfyInject] Message ${index} saved with ${successCount} injected image(s)`);
-
-    return {
-        repairedCount,
-        totalCount: results.length,
-    };
 }
 
 /**
@@ -760,6 +863,8 @@ export function initDom() {
             return;
         }
 
+        // New generation supersedes any in-progress results from a previous one.
+        bumpGenerationId();
         resetLiveStream();
     });
 
@@ -770,15 +875,22 @@ export function initDom() {
     });
 
     eventSource.on(event_types.GENERATION_ENDED, stopLiveStreamScanner);
-    eventSource.on(event_types.GENERATION_STOPPED, stopLiveStreamScanner);
 
-    // Process new bot messages as they are rendered
-    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, async (index) => {
-        await processMessage(index);
+    // User cancelled — discard all in-progress jobs and live stream state.
+    eventSource.on(event_types.GENERATION_STOPPED, () => {
+        bumpGenerationId();
+        clearLiveStream();
     });
 
-    // Re-scan when chat changes
+    // Process new bot messages as they are rendered.
+    // checkGenerationId: true so cancellation/retry/new-generation discards results.
+    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, async (index) => {
+        await processMessage(index, { checkGenerationId: true });
+    });
+
+    // Re-scan when chat changes — clear everything first so no stale jobs survive.
     eventSource.on(event_types.CHAT_CHANGED, async () => {
+        bumpGenerationId();
         clearLiveStream();
         await scanExistingMessages();
     });
