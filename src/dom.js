@@ -152,6 +152,10 @@ function formatMarkerPosition(markerNumber, totalMarkers) {
 let activeStream = null;
 const LIVE_STREAM_SCAN_INTERVAL_MS = 500;
 
+// True while a renderLiveStream() call is already queued for the next animation frame.
+// Prevents queuing more than one rAF per frame.
+let liveRenderScheduled = false;
+
 // Tracks which message indices are currently being processed to prevent duplicate jobs.
 const processingMessages = new Set();
 
@@ -201,6 +205,24 @@ function clearLiveStream() {
 }
 
 /**
+ * Schedules renderLiveStream() for the next animation frame.
+ * Multiple calls within the same frame are coalesced into one render.
+ *
+ * ST fires STREAM_TOKEN_RECEIVED before it calls onProgressStreaming() to
+ * update the DOM (they are consecutive awaits in the streaming loop).
+ * Deferring to rAF guarantees we run after ST has written the formatted HTML
+ * but before the browser paints, so the user only ever sees our version.
+ */
+function scheduleRenderLiveStream() {
+    if (liveRenderScheduled) return;
+    liveRenderScheduled = true;
+    requestAnimationFrame(() => {
+        liveRenderScheduled = false;
+        if (activeStream?.jobs.size > 0) renderLiveStream();
+    });
+}
+
+/**
  * Returns the best current message index to use while streaming.
  * During normal streaming ST has already created the live bot message.
  * @returns {number}
@@ -245,9 +267,10 @@ function updateStreamText(text) {
         activeStream.text += incoming;
     }
 
-    // Override ST's streaming DOM update with our processed version.
-    // Direct innerHTML is cheap enough to run on every token.
-    if (activeStream.jobs.size > 0) renderLiveStream();
+    // Schedule a render for the next animation frame.
+    // ST updates the DOM *after* firing this event, so a direct call here
+    // would read stale HTML.  rAF fires after ST's DOM write but before paint.
+    if (activeStream.jobs.size > 0) scheduleRenderLiveStream();
 }
 
 /**
@@ -313,8 +336,10 @@ function getLiveGeneration(parsed, markerIndex) {
  * Markers with completed jobs are replaced with images or error spans.
  * Markers with in-flight jobs are replaced with pending placeholder spans.
  *
- * Directly writes to the .mes_text DOM node so ST's per-token streaming
- * renders cannot overwrite our output. Does not touch message.mes so
+ * Reads ST's already-formatted .mes_text innerHTML, replaces [[IMG:...]]
+ * fragments with placeholders or images, and writes the result back.
+ * Operating on the formatted HTML preserves ST's markdown styling
+ * (coloured quotes, bold, etc.) and avoids overwriting message.mes so
  * processMessage still sees the raw markers when the stream ends.
  */
 function renderLiveStream() {
@@ -322,13 +347,20 @@ function renderLiveStream() {
 
     const messageIndex = getLiveMessageIndex();
 
-    // Count total markers in the current stream buffer for position labels.
-    const totalMarkers = (activeStream.text.match(/\[\[IMG:\s*.+?\s*\]\]/gs) || []).length;
+    // Read ST's already-formatted HTML rather than the raw stream buffer.
+    // [[IMG:...]] is not a markdown construct so it appears literally in the
+    // rendered output.  Replacing only those fragments lets us keep ST's
+    // surrounding formatting (coloured quotes, bold, etc.) intact.
+    const msgNode = document.querySelector(`[mesid="${messageIndex}"] .mes_text`);
+    if (!msgNode) return;
+
+    const currentHtml = msgNode.innerHTML;
+
+    const totalMarkers = (currentHtml.match(/\[\[IMG:\s*.+?\s*\]\]/gs) || []).length;
     if (totalMarkers === 0) return;
 
-    // Replace each [[IMG:...]] with its current job state.
     let markerIdx = 0;
-    const displayText = activeStream.text.replace(/\[\[IMG:\s*.+?\s*\]\]/gs, () => {
+    const displayHtml = currentHtml.replace(/\[\[IMG:\s*.+?\s*\]\]/gs, () => {
         const i = markerIdx++;
         const key = getMarkerJobKey(i);
         const job = activeStream?.jobs.get(key);
@@ -345,12 +377,7 @@ function renderLiveStream() {
         return `<span class="comfyinject-error">[Image generation failed${markerPosition ? `: marker${markerPosition}` : ""}]</span>`;
     });
 
-    // Direct DOM update — fast enough to call on every token.
-    // ST's streaming renderer overwrites .mes_text on each token; by updating
-    // the same node directly we always have the last word without a full
-    // message re-render.
-    const msgNode = document.querySelector(`[mesid="${messageIndex}"] .mes_text`);
-    if (msgNode) msgNode.innerHTML = displayText;
+    if (displayHtml !== currentHtml) msgNode.innerHTML = displayHtml;
 }
 
 /**
